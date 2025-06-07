@@ -4,13 +4,13 @@ venv/bin/activate:
 	python -m venv venv && . venv/bin/activate && pip install -r requirements.txt
 
 scrape-now:
-	python -m src.batch_scraper.fetch_all
+	python3 -m src.batch_scraper.fetch_all
 
 parse:
-	python -m src.preprocessing.build_json
+	python3 -m src.preprocessing.build_json
 
 index:
-	python -m src.indexing.build_index
+	python3 -m src.indexing.build_index
 
 ui:
 	streamlit run src/ui/app.py
