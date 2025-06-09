@@ -1,37 +1,14 @@
-"""Stage4 – RAG powered by **GoogleGemini2.5Pro (experimental)**
-=================================================================
-Cloud‑only retrieval‑augmented answering that calls Google’s newest
-**Gemini2.5Pro** endpoint via the official `google‑generativeai` SDK.
-No OpenAI / OpenRouter / local LLM downloads.
+"""
+Stage 4 — Retrieval-Augmented QA with Gemini 2.5 Pro
+===================================================
 
-Free quota (as of June2025)
----------------------------
-* ~1million input characters per day
-* ~20 requests per minute
-Perfect for testing. When you upgrade to a paid GoogleCloud project you
-just swap the API key.
+• Loads FAISS indexes if present; else falls back to NumPy matrices saved
+  by Stage 3 — zero crashes on machines without faiss-cpu wheels.
+• Returns answer, per-snippet citations, and first image of each article.
 
-Quick start
+Environment
 -----------
-```bash
-pip install google-generativeai faiss-cpu sentence-transformers numpy tqdm pillow
-
-# 1– create a key at https://aistudio.google.com/app/apikey
-export GEMINI_API_KEY="AIza..."
-
-# 2– run a query
-python -m src.rag.qa "What did Andrew Ng announce in the first issue of The Batch?"
-```
-
-Optional env‑vars
------------------
-| Variable        | Default                        | Purpose                               |
-|-----------------|--------------------------------|---------------------------------------|
-| `GEMINI_API_KEY`| —                              | *Required* AIStudio key               |
-| `GEMINI_MODEL`  | `gemini-1.5-pro-latest`        | Gemini variant (2.5Pro uses this tag) |
-| `RAG_TOP_K`     | `6`                            | Retrieval depth                       |
-| `RAG_TEMP`      | `0.2`                          | Sampling temperature                  |
-| `RAG_MAX_OUT`   | `512`                          | Max output tokens                     |
+GEMINI_API_KEY  (required) — get one free at https://aistudio.google.com/app/apikey
 """
 from __future__ import annotations
 
@@ -42,76 +19,60 @@ from pathlib import Path
 from typing import Dict, List
 
 import numpy as np
-import torch
-from sentence_transformers import SentenceTransformer  # type: ignore
+from sentence_transformers import SentenceTransformer
 
+# ---------- optional FAISS --------------------------------------------------
 try:
-    import faiss  # type: ignore
-except ImportError as err:  # pragma: no cover
-    raise SystemExit("faiss-cpu missing – `pip install faiss-cpu`") from err
+    import faiss
+except ImportError:
+    faiss = None
 
+# ---------- Google Gemini client -------------------------------------------
 try:
-    import google.generativeai as genai  # type: ignore
-except ImportError as err:  # pragma: no cover
-    raise SystemExit("google-generativeai missing – `pip install google-generativeai`") from err
-
-# ---------------------------------------------------------------------------
-# Paths & constants ----------------------------------------------------------
-
-ROOT = Path(__file__).resolve().parents[2]  # project root
-DATA_DIR = ROOT / "data"
-INDEX_DIR = DATA_DIR / "index"
-TEXT_INDEX_PATH = INDEX_DIR / "text.index"
-META_PATH = INDEX_DIR / "text_meta.pkl"
-ARTICLES_JSONL = DATA_DIR / "processed" / "batch_articles.jsonl"
-
-EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+    import google.generativeai as genai
+except ImportError:
+    raise SystemExit("`pip install google-generativeai` first")
 
 API_KEY = os.getenv("GEMINI_API_KEY")
 if not API_KEY:
-    raise SystemExit("Set GEMINI_API_KEY env var. Create one at https://aistudio.google.com/app/apikey")
+    raise SystemExit("Set GEMINI_API_KEY environment variable.")
 
 genai.configure(api_key=API_KEY)
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-pro-latest")
+GEMINI  = genai.GenerativeModel("gemini-2.0-flash")
 
-TOP_K = int(os.getenv("RAG_TOP_K", 6))
-TEMP = float(os.getenv("RAG_TEMP", 0.2))
-MAX_OUT = int(os.getenv("RAG_MAX_OUT", 512))
-SNIP = 350  # characters per snippet
+# ---------- paths & constants ----------------------------------------------
+ROOT   = Path(__file__).resolve().parents[2]
+IDXDIR = ROOT / "data" / "index"
 
-PROMPT_TMPL = (
-    "You are a precise AI assistant. Use only the numbered CONTEXT to answer the QUESTION. "
-    "Quote phrases and cite the source number like [3]. If the answer is not in context, say 'I don't know'.\n\n"
+TXT_META_PKL = IDXDIR / "text_meta.pkl"
+TXT_VEC_NPY  = IDXDIR / "text_vecs.npy"
+TXT_FAISS    = IDXDIR / "text.index"
+
+ARTICLES_JSONL = ROOT / "data" / "processed" / "batch_articles.jsonl"
+EMBED_MODEL    = "sentence-transformers/all-MiniLM-L6-v2"
+
+TOP_K   = 200
+SNIP    = 5000         # chars in prompt
+TEMP    = 0.2
+MAX_TOK = 50000
+
+PROMPT = (
+    "You are a precise AI assistant.  Use only the numbered CONTEXT lines "
+    "to answer the QUESTION.  Quote and cite by number like [2]. "
+    "If the answer is not in context, say \"I don't know.\".\n\n"
     "CONTEXT:\n{ctx}\n\nQUESTION: {q}\nANSWER:"
 )
 
-# ---------------------------------------------------------------------------
-# Lazy singletons ------------------------------------------------------------
+# ---------- lazy globals ----------------------------------------------------
+_txt_idx   = None     # faiss index
+_txt_vecs  = None     # np.ndarray
+_txt_meta  = None
+_articles  = None
+_st_model  = None
 
-_text_index = _meta = _articles = None
-_embedder: SentenceTransformer | None = None
-_gemini = None
-
-# ---------------------------------------------------------------------------
-# Helpers -------------------------------------------------------------------
-
-def _device() -> str:
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
-
-
-def _load_index():
-    global _text_index, _meta  # noqa: PLW0603
-    if _text_index is None:
-        _text_index = faiss.read_index(str(TEXT_INDEX_PATH))
-        _meta = pickle.load(META_PATH.open("rb"))
-
-
+# ---------- loaders ---------------------------------------------------------
 def _load_articles():
-    global _articles  # noqa: PLW0603
+    global _articles
     if _articles is None:
         _articles = {}
         with ARTICLES_JSONL.open() as fh:
@@ -120,58 +81,73 @@ def _load_articles():
                 _articles[rec["id"]] = rec
 
 
-def _load_embedder(dev: str):
-    global _embedder  # noqa: PLW0603
-    if _embedder is None:
-        _embedder = SentenceTransformer(EMBED_MODEL, device=dev)
-    return _embedder
+def _load_text_backend():
+    """Guarantee either _txt_idx OR _txt_vecs + _txt_meta are ready."""
+    global _txt_idx, _txt_vecs, _txt_meta
+
+    if _txt_meta is None:
+        _txt_meta = pickle.load(TXT_META_PKL.open("rb"))
+
+    if faiss is not None and TXT_FAISS.exists():
+        if _txt_idx is None:
+            _txt_idx = faiss.read_index(str(TXT_FAISS))
+        return
+
+    # fall back to numpy matrix
+    if _txt_vecs is None:
+        _txt_vecs = np.load(TXT_VEC_NPY)
+    return
 
 
-def _gemini():
-    global _gemini  # noqa: PLW0603
-    if _gemini is None:
-        _gemini = genai.GenerativeModel(GEMINI_MODEL)
-    return _gemini
+def _get_embedder():
+    global _st_model
+    if _st_model is None:
+        _st_model = SentenceTransformer(EMBED_MODEL, device="cpu")
+    return _st_model
 
-# ---------------------------------------------------------------------------
-# Core API -------------------------------------------------------------------
-
-def answer(question: str, *, k: int = TOP_K) -> Dict:
-    """Return answer + sources + first image (if any)."""
-    dev = _device()
-    _load_index(); _load_articles()
-    embedder = _load_embedder(dev)
+# ---------- core ------------------------------------------------------------
+def answer(question: str, top_k: int = TOP_K) -> Dict:
+    _load_articles()
+    _load_text_backend()
+    embedder = _get_embedder()
 
     qv = embedder.encode(question, normalize_embeddings=True).astype("float32")
-    _, idxs = _text_index.search(qv.reshape(1, -1), k)
+
+    # --- retrieve -----------------------------------------------------------
+    if _txt_idx is not None:                                # faiss path
+        _, idxs = _txt_idx.search(qv.reshape(1, -1), top_k)
+        hit_idx = idxs[0]
+    else:                                                   # NumPy path
+        sims = _txt_vecs @ qv
+        hit_idx = np.argsort(-sims)[:top_k]
 
     ctx_lines: List[str] = []
-    cites: List[dict] = []
+    citations: List[dict] = []
     images: List[dict] = []
 
-    for rank, idx in enumerate(idxs[0], 1):
-        m = _meta[idx]
+    for rank, idx in enumerate(hit_idx, 1):
+        m = _txt_meta[idx]
         art = _articles[m["parent_id"]]
         snippet = m.get("text") or art["text"][:SNIP]
         ctx_lines.append(f"[{rank}] {snippet}")
-        cites.append({"title": m["title"], "date": m["date"], "chunk": m["chunk"], "rank": rank})
+        citations.append({"rank": rank, "title": art["title"], "date": art["date"]})
         if art.get("images"):
             images.append(art["images"][0])
 
-    prompt = PROMPT_TMPL.format(ctx="\n".join(ctx_lines), q=question)
+    prompt = PROMPT.format(ctx="\n".join(ctx_lines), q=question)
 
-    gem = _gemini()
-    resp = gem.generate_content(prompt, generation_config={
-        "temperature": TEMP,
-        "top_p": 0.95,
-        "max_output_tokens": MAX_OUT,
-    })
-    answer_text = resp.text.strip()
+    resp = GEMINI.generate_content(
+        prompt,
+        generation_config={
+            "temperature": TEMP,
+            "top_p": 0.95,
+            "max_output_tokens": MAX_TOK,
+        },
+    )
+    return {"answer": resp.text.strip(), "sources": citations, "images": images}
 
-    return {"answer": answer_text, "sources": cites, "images": images}
-
-
+# ---------- CLI -------------------------------------------------------------
 if __name__ == "__main__":
     import sys, json
-    q = sys.argv[1] if len(sys.argv) > 1 else "What did Andrew Ng announce in the very first issue of The Batch?"
+    q = "What did Andrew Ng announce in the first issue?" if len(sys.argv) == 1 else " ".join(sys.argv[1:])
     print(json.dumps(answer(q), indent=2, ensure_ascii=False))
