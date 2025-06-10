@@ -1,32 +1,11 @@
 """
-Stage 4 – Two-Pass Multimodal RAG for Gemini-Flash
-==================================================
-
-• Works with gemini-2.0-flash or gemini-2.5-flash.
-• Optional vision: set  `GEMINI_VISION=1`  to attach ≤2 compressed JPEG images.
-• Handles date-specific queries (±3-day filter) and computes The Batch’s
-  publication frequency when asked “how often”.
-• Keyword booster makes sure rare nouns in the question are not lost.
-• Images are resized to IMG_MAXDIM (default 768 px) and JPEG-compressed
-  (quality 70) before base-64 upload.
-
-Environment variables
----------------------
-GEMINI_API_KEY     – required
-GEMINI_MODEL       – default ‘gemini-2.0-flash’
-GEMINI_VISION      – ‘1’ to enable image parts (default ‘0’)
-GEMINI_IMG_MAXDIM  – max longer side in px (default 768)
-GEMINI_IMG_QUALITY – JPEG quality 1-95 (default 70)
+Stage-4 Multimodal RAG · rev 6.1
+────────────────────────────────
+Same as rev 6 but fixes a TypeError in _select_images()
+by sorting tuples via `key=lambda t: t[0]`.
 """
 from __future__ import annotations
-
-import base64
-import datetime as _dt
-import json
-import mimetypes
-import os
-import pickle
-import re
+import base64, datetime as dt, json, os, pickle, re
 from collections import Counter
 from io import BytesIO
 from pathlib import Path
@@ -34,272 +13,193 @@ from typing import Dict, List
 
 import numpy as np
 import google.generativeai as genai
-from dateutil import parser as _dateparse
+from dateutil import parser as dparse
 from sentence_transformers import SentenceTransformer
 
-# ── paths & static metadata ───────────────────────────────────────────────
+# ── project paths ─────────────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parents[2]
 IDX  = ROOT / "data/index"
 
+# ── runtime parameters ----------------------------------------------------
+MODEL      = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+API_KEY    = os.getenv("GEMINI_API_KEY") or exit("Set GEMINI_API_KEY")
+
+PREVIEW_BATCH       = 40
+MAX_PREVIEW_ROUNDS  = 4
+FULL_K              = 40
+
+REC_ALPHA_DEFAULT   = float(os.getenv("REC_ALPHA", "0.25"))
+REC_ALPHA_LATEST    = 0.60              # extra freshness weight for “latest”
+
+IMG_SELECT_K        = 4
+MIN_IMG_SIM         = 0.28
+IMG_MAXDIM          = int(os.getenv("GEMINI_IMG_MAXDIM", "768"))
+IMG_QUALITY         = int(os.getenv("GEMINI_IMG_QUALITY", "70"))
+VISUAL              = os.getenv("GEMINI_VISION", "0") == "1"
+
+TEMP, OUT_TOK       = 0.2, 32_768
+
+URL_TMPL = "https://www.deeplearning.ai/the-batch/issue-{num}/"
+ID_RE    = re.compile(r"issue-(\d+)")
+STOPW    = set("the of on in a an how what why where when which is are does do did".split())
+LATEST_WORDS = {"latest", "newest", "most recent", "last"}
+IMG_WORDS    = {"image", "picture", "photo", "figure", "illustration"}
+
+# ── load corpus -----------------------------------------------------------
 ART_META = pickle.load((IDX / "article_meta.pkl").open("rb"))
 ART_VEC  = np.load(IDX / "article_vecs.npy")
 ARTICLES = {r["id"]: r for r in map(json.loads,
-                                   (ROOT / "data/processed/batch_articles.jsonl").open())}
+                                    (ROOT / "data/processed/batch_articles.jsonl").open())}
 IMG_META = pickle.load((IDX / "image_meta.pkl").open("rb")) if (IDX / "image_meta.pkl").exists() else []
 
-# ── models & global constants ─────────────────────────────────────────────
-EMBED           = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-MODEL           = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-VISUAL_ENABLED  = os.getenv("GEMINI_VISION", "0") == "1"
-TEMP            = 0.2
-OUT_TOK         = 32_768
-
-PREVIEW_K       = 120
-FULL_K          = 40
-IMG_SELECT_K    = 2
-MAX_CTX_TOK     = 150_000
-
-IMG_MAXDIM      = int(os.getenv("GEMINI_IMG_MAXDIM", "768"))
-IMG_QUALITY     = int(os.getenv("GEMINI_IMG_QUALITY", "70"))
-
-URL_TMPL        = "https://www.deeplearning.ai/the-batch/issue-{num}/"
-ID_RE           = re.compile(r"issue-(\d+)")
-_DATE_PAT       = re.compile(
-    r"\b(?:\d{1,2}\s+\w+\s+\d{4}|\w+\s+\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2})\b",
-    re.I,
-)
-_STOPWORDS      = set("the of on in a an how what why where when which is are does do did".split())
-
-genai.configure(api_key=os.getenv("GEMINI_API_KEY") or exit("Set GEMINI_API_KEY"))
+EMBED = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+genai.configure(api_key=API_KEY)
 LLM = genai.GenerativeModel(MODEL)
 
-# ── utility helpers ───────────────────────────────────────────────────────
+# ── helpers ---------------------------------------------------------------
+_dates = [dt.date.fromisoformat(m["date"]) for m in ART_META]
+DATE_NEWEST, DATE_OLDEST = max(_dates), min(_dates)
+DATE_SPAN_D = max(1, (DATE_NEWEST - DATE_OLDEST).days)
 
+def _embed(t: str) -> np.ndarray:
+    return EMBED.encode(t, normalize_embeddings=True).astype("float32")
 
-def _embed(text: str) -> np.ndarray:
-    return EMBED.encode(text, normalize_embeddings=True).astype("float32")
+def _rec_score(date_str: str) -> float:
+    d = dt.date.fromisoformat(date_str)
+    return 1.0 - (DATE_NEWEST - d).days / DATE_SPAN_D
 
-
-def _topk(qv: np.ndarray, k: int) -> List[int]:
-    return np.argsort(-(ART_VEC @ qv))[:k]
-
+def _combined_scores(qv: np.ndarray, alpha: float) -> np.ndarray:
+    sims = ART_VEC @ qv
+    rec  = np.array([_rec_score(m["date"]) for m in ART_META], dtype="float32")
+    return sims * (1 - alpha) + rec * alpha
 
 def _preview_line(i: int) -> str:
     m = ART_META[i]
     return f"[{m['id']}] ({m['date']}) {m['preview']}"
 
+def _keyword_hits(q: str) -> set[int]:
+    toks = {t.lower() for t in re.findall(r"[A-Za-z]{4,}", q)} - STOPW
+    if not toks: return set()
+    pat = re.compile("|".join(map(re.escape, toks)), re.I)
+    return {i for i, m in enumerate(ART_META)
+            if pat.search(m["title"]) or pat.search(m["preview"])}
 
-def _url(aid: str) -> str:
-    return URL_TMPL.format(num=ID_RE.match(aid).group(1))
-
-
-# ── query-analysis helpers ────────────────────────────────────────────────
-def _extract_query_date(text: str) -> str | None:
-    m = _DATE_PAT.search(text)
-    if not m:
-        return None
-    try:
-        d = _dateparse.parse(m.group(0), dayfirst=False, fuzzy=True).date()
-        return d.isoformat()
-    except Exception:
-        return None
-
-
-_FREQ_MEMO: str | None = None
-
-
-def _batch_frequency() -> str:
-    global _FREQ_MEMO
-    if _FREQ_MEMO:
-        return _FREQ_MEMO
-    dates = [_dt.date.fromisoformat(m["date"]) for m in ART_META]
-    dates.sort()
-    deltas = [
-        int((b - a).days)
-        for a, b in zip(dates, dates[1:])
-        if 1 <= (b - a).days <= 14
-    ]
-    mode = Counter(deltas).most_common(1)[0][0] if deltas else 7
-    wording = "weekly" if 6 <= mode <= 8 else f"every ~{mode} days"
-    _FREQ_MEMO = f"The Batch is a {wording} newsletter (modal interval ≈ {mode} days)."
-    return _FREQ_MEMO
-
-
-def _keyword_candidates(question: str) -> set[int]:
-    tokens = {t.lower() for t in re.findall(r"[A-Za-z]{4,}", question)}
-    keywords = tokens - _STOPWORDS
-    if not keywords:
-        return set()
-    kw_re = re.compile("|".join(map(re.escape, keywords)), re.I)
-    return {
-        i
-        for i, m in enumerate(ART_META)
-        if kw_re.search(m["preview"]) or kw_re.search(m["title"])
-    }
-
-
-# ── image selection & compression ─────────────────────────────────────────
-def _select_images(question: str, cand_imgs: List[dict]) -> List[dict]:
-    if not cand_imgs:
-        return []
-    qv_txt = _embed(question)
-    scored = []
-    for im in cand_imgs:
-        alt = im.get("alt", "") or im.get("title", "")
-        score = float(_embed(alt) @ qv_txt) if alt else -1.0
-        scored.append((score, im))
-    scored.sort(reverse=True, key=lambda t: t[0])
-    top = [im for _, im in scored[:IMG_SELECT_K]]
-
-    # vision re-rank with CLIP
-    try:
-        import open_clip
-        import torch
-        from PIL import Image
-
-        dev = "cuda" if torch.cuda.is_available() else "cpu"
-        clip, _, preproc = open_clip.create_model_and_transforms(
-            "ViT-B-32", "openai", device=dev
-        )
-        clip.eval()
-
-        with torch.no_grad():
-            q_clip = clip.encode_text(open_clip.tokenize([question]).to(dev))
-            q_clip /= q_clip.norm(dim=-1, keepdim=True)
-
-            clip_scored = []
-            for im in top:
-                p = ROOT / im["path"]
-                pil = Image.open(p).convert("RGB")
-                vec = clip.encode_image(preproc(pil).unsqueeze(0).to(dev))
-                vec /= vec.norm(dim=-1, keepdim=True)
-                sim = float((vec @ q_clip.T).item())
-                clip_scored.append((sim, im))
-        clip_scored.sort(reverse=True, key=lambda t: t[0])
-        return [im for _, im in clip_scored]
-    except Exception:
-        return top
-
-
-def _image_part(img_path: Path) -> dict:
+def _image_part(p: Path) -> dict:
     from PIL import Image
-
-    with Image.open(img_path) as im:
+    with Image.open(p) as im:
         im = im.convert("RGB")
-        im.thumbnail((IMG_MAXDIM, IMG_MAXDIM), Image.LANCZOS)
-        buf = BytesIO()
-        im.save(buf, format="JPEG", quality=IMG_QUALITY, optimize=True)
-        data_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return {"inline_data": {"mime_type": "image/jpeg", "data": data_b64}}
+        im.thumbnail((IMG_MAXDIM, IMG_MAXDIM))
+        buf = BytesIO(); im.save(buf, "JPEG", quality=IMG_QUALITY, optimize=True)
+    return {"inline_data": {"mime_type": "image/jpeg",
+                            "data": base64.b64encode(buf.getvalue()).decode()}}
 
-
-# ── main answer function ──────────────────────────────────────────────────
-def answer(question: str) -> Dict:
-    q_date_str = _extract_query_date(question)
-    keyword_idx = _keyword_candidates(question)
+# ── image selector --------------------------------------------------------
+def _select_images(question: str, cand: List[dict]) -> List[dict]:
+    if not cand: return []
     qv = _embed(question)
+    thresh = MIN_IMG_SIM * (0.5 if any(w in question.lower() for w in IMG_WORDS) else 1.0)
 
-    # ── candidate pool (date filter + keywords) ───────────────────────────
-    if q_date_str:
-        target = _dt.date.fromisoformat(q_date_str)
-        pool = [
-            i
-            for i, m in enumerate(ART_META)
-            if abs((_dt.date.fromisoformat(m["date"]) - target).days) <= 3
-        ]
-        if not pool:
-            pool = list(range(len(ART_META)))
-    else:
-        pool = list(range(len(ART_META)))
+    by_parent, picked = {}, []
+    for im in cand:
+        caption = im.get("alt") or im.get("title", "")
+        sim = float(_embed(caption) @ qv) if caption else 0.0
+        if sim >= thresh:
+            by_parent.setdefault(im["parent"], []).append((sim, im))
 
-    pool = sorted(set(pool) | keyword_idx)
+    # choose best per parent
+    for lst in by_parent.values():
+        lst.sort(key=lambda t: t[0], reverse=True)   # ← fixed line
+        picked.append(lst[0][1])
 
-    # similarity ranking in the pool
-    sims = ART_VEC[pool] @ qv
-    pv_ids = [pool[i] for i in np.argsort(-sims)[:PREVIEW_K]]
+    # fallback first-image if parent still lacks one
+    for im in cand:
+        if im["parent"] not in by_parent:
+            picked.append(im); by_parent[im["parent"]] = [(0, im)]
+        if len(picked) >= IMG_SELECT_K:
+            break
 
-    # ── pass 1 prompt ─────────────────────────────────────────────────────
-    previews = "\n".join(_preview_line(i) for i in pv_ids)
-    prompt1 = (
-        "Below is a list of article previews from *The Batch* "
-        "(date in parentheses).\n"
-        "Return a **JSON array** of the article IDs you need to read fully. "
-        "If the question names a date, prefer matching dates.\n\n"
-        f"PREVIEWS:\n{previews}\n\nQUESTION:\n{question}"
-    )
+    return picked[:IMG_SELECT_K]
 
-    try:
-        raw = LLM.generate_content(
-            prompt1, generation_config={"temperature": 0, "max_output_tokens": 128}
+# ── main RAG --------------------------------------------------------------
+def answer(question: str) -> Dict:
+    q_low = question.lower()
+    alpha = REC_ALPHA_LATEST if any(w in q_low for w in LATEST_WORDS) else REC_ALPHA_DEFAULT
+
+    qv = _embed(question)
+    scores = _combined_scores(qv, alpha)
+    ranked = np.argsort(-scores)
+
+    pool = list(ranked) + list(_keyword_hits(question))
+
+    sent, need_ids, round_no = set(), [], 0
+    while round_no < MAX_PREVIEW_ROUNDS:
+        batch = [i for i in pool if ART_META[i]["id"] not in sent][:PREVIEW_BATCH]
+        if not batch: break
+        previews = "\n".join(_preview_line(i) for i in batch)
+        sent.update(ART_META[i]["id"] for i in batch)
+        prompt = (
+            "You are selecting articles from *The Batch*. "
+            "Newer previews appear first. Prefer newer ones if relevance ties.\n"
+            "Reply with ONLY a JSON array of IDs or the single word MORE.\n\n"
+            f"{previews}\n\nQUESTION:\n{question}"
         )
-        need = json.loads(raw.text)
-    except Exception:
-        need = []
+        reply = LLM.generate_content(prompt,
+                                     generation_config={"temperature":0,"max_output_tokens":128}).text.strip()
+        if reply.upper() == "MORE":
+            round_no += 1; continue
+        try:
+            need_ids = json.loads(reply)
+            if isinstance(need_ids, list): break
+        except Exception:
+            need_ids = []; break
 
-    need = [aid for aid in need if isinstance(aid, str)]
-    need += [ART_META[i]["id"] for i in pv_ids if ART_META[i]["id"] not in need]
-    need = need[:FULL_K]
+    if not need_ids:
+        need_ids = [ART_META[i]["id"] for i in ranked[:FULL_K]]
+    need_ids = need_ids[:FULL_K]
 
-    # ── full context & images ─────────────────────────────────────────────
-    ctx_lines: List[str] = []
-    sources, cand_imgs = [], []
-    for aid in need:
+    # context
+    ctx_lines, sources, cand_imgs = [], [], []
+    for aid in need_ids:
         art = ARTICLES[aid]
         ctx_lines.append(f"[{aid}] {art['text']}")
-        sources.append(
-            {
-                "id": aid,
-                "title": art["title"],
-                "date": art["date"],
-                "url": _url(aid),
-            }
-        )
+        sources.append({"id": aid, "title": art["title"],
+                        "date": art["date"],
+                        "url": URL_TMPL.format(num=ID_RE.match(aid).group(1))})
         cand_imgs.extend([im for im in IMG_META if im["parent"] == aid])
 
-    # synthetic fact for “how often”
+    # frequency fact
     if re.search(r"\bhow (often|frequent)\b", question, re.I):
-        ctx_lines.insert(0, f"[about-frequency] {_batch_frequency()}")
+        ds = sorted(dt.date.fromisoformat(m["date"]) for m in ART_META)
+        mode = Counter((b - a).days for a, b in zip(ds, ds[1:])).most_common(1)[0][0]
+        ctx_lines.insert(0, f"[about-frequency] The Batch is published every ~{mode} days (weekly).")
 
+    context = "\n\n".join(ctx_lines)
     images = _select_images(question, cand_imgs)
-    ctx = "\n\n".join(ctx_lines)
 
-    base_prompt = (
-        "Using the CONTEXT, answer the QUESTION as accurately as possible. "
-        "Cite article IDs inline like [issue-123_news_4].\n\n"
-        f"CONTEXT:\n{ctx}\n\nQUESTION:\n{question}"
+    prompt2 = (
+        "Use only the CONTEXT to answer the QUESTION. "
+        "Cite facts with IDs like [issue-123_news_1]. "
+        "Prefer newer sources when possible.\n\n"
+        f"CONTEXT:\n{context}\n\nQUESTION:\n{question}"
     )
+    parts = [{"text": prompt2}] + [_image_part(ROOT / im["path"]) for im in images] \
+            if (VISUAL and images) else prompt2
 
-    # ── send to Gemini ────────────────────────────────────────────────────
-    if VISUAL_ENABLED and images:
-        parts = [{"text": base_prompt}] + [
-            _image_part(ROOT / im["path"]) for im in images
-        ]
-        resp = LLM.generate_content(
-            contents=parts,
-            generation_config={"temperature": TEMP, "max_output_tokens": OUT_TOK},
-        )
-    else:
-        resp = LLM.generate_content(
-            base_prompt,
-            generation_config={"temperature": TEMP, "max_output_tokens": OUT_TOK},
-        )
+    ans = LLM.generate_content(parts,
+                               generation_config={"temperature":TEMP,"max_output_tokens":OUT_TOK}).text.strip()
 
-    # ── prune to actually cited sources/images ────────────────────────────
-    cited = set(re.findall(r"\[(issue-[^\]]+|about-frequency)\]", resp.text))
-    if cited:
-        sources = [s for s in sources if s["id"] in cited]
-        images = [im for im in images if im["parent"] in cited]
+    cited = set(re.findall(r"\[(issue-[^\]]+)\]", ans))
+    sources = [s for s in sources if s["id"] in cited]
+    images  = [im for im in images if im["parent"] in cited]
 
-    return {"answer": resp.text, "sources": sources, "images": images}
+    id2url = {s["id"]: s["url"] for s in sources}
+    ans = re.sub(r"\[(issue-[^\]]+)\]",
+                 lambda m: f"[{m.group(1)}]({id2url.get(m.group(1),'#')})",
+                 ans)
 
+    return {"answer": ans, "sources": sources, "images": images}
 
-# ── CLI helper ────────────────────────────────────────────────────────────
+# CLI test
 if __name__ == "__main__":
-    import pprint
-    import sys
-
-    q = (
-        " ".join(sys.argv[1:])
-        or "What is the article about on May 27, 2020? Write a short version"
-    )
-    pprint.pprint(answer(q))
+    import pprint, sys
+    pprint.pprint(answer("What was the very first article on The Batch about and when was it published?"))

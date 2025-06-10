@@ -40,9 +40,9 @@ OUT    = ROOT / "data/index"; OUT.mkdir(parents=True, exist_ok=True)
 TXT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 IMG_MODEL = ("ViT-B-32", "openai")         # (arch, weights tag)
 
-CHUNK_W, STRIDE = 400, 200
-SUMMARY_W       = 150                      # article-level summary window
-PREVIEW_CHARS   = 1_200                    # stored in article_meta
+CHUNK_W, STRIDE = 600, 300
+SUMMARY_W       = 200                      # article-level summary window
+PREVIEW_CHARS   = 1_600                    # stored in article_meta
 
 ID_RE = re.compile(r"issue-(\d+)")
 
