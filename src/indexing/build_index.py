@@ -1,151 +1,144 @@
 """
-Stage 3 — Multimodal Embedding & Index Builder
+Stage 3 – Rich Index Builder (2025-06-12 rev 2)
 ==============================================
 
-• Embeds text chunks (Sentence-Transformers MiniLM) and images (OpenCLIP ViT-B/32).
-• Always writes *both* FAISS indexes **and** `.npy` fallback matrices so
-  Stage 4 works on any machine, with or without faiss-cpu wheels.
-• Cross-platform: CUDA ▶︎ Apple Silicon (MPS) ▶︎ CPU.
+• Builds THREE vector spaces
+    ① Article-level (first 150 words)
+    ② Chunk-level  (400-word windows, stride 200)
+    ③ Image vision vectors (optional)
 
-Output layout
--------------
+• Saves previews (1 200 chars) + issue number → enables URL lookup.
+• Always writes both FAISS indexes **and** `.npy` matrices.
+
+Directory layout
+----------------
 data/index/
-├── text.index            # if faiss available
-├── text_meta.pkl
-├── text_vecs.npy         # always
-├── image.index           # if faiss available
-├── image_meta.pkl
-└── image_vecs.npy        # always
+    article.index / article_vecs.npy / article_meta.pkl
+    chunk.index   / chunk_vecs.npy   / chunk_meta.pkl
+    image.index   / image_vecs.npy   / image_meta.pkl
 """
 from __future__ import annotations
-
-import argparse
-import json
-import pickle
-import platform
+import argparse, json, pickle, platform, re
 from pathlib import Path
 from typing import List
 
-import numpy as np
-import torch
+import numpy as np, torch
 from PIL import Image
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
-# ---------- optional FAISS --------------------------------------------------
 try:
-    import faiss       # type: ignore
-except ImportError:    # pragma: no cover
-    faiss = None
+    import faiss
+except ImportError:
+    faiss = None                           # NumPy fallback
 
-# ---------- paths & models --------------------------------------------------
-ROOT          = Path(__file__).resolve().parents[2]
-PROCESSED_JSON = ROOT / "data" / "processed" / "batch_articles.jsonl"
-OUT_DIR        = ROOT / "data" / "index"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+# ── config ────────────────────────────────────────────────────────────────
+ROOT   = Path(__file__).resolve().parents[2]
+RAW    = ROOT / "data/processed/batch_articles.jsonl"
+OUT    = ROOT / "data/index"; OUT.mkdir(parents=True, exist_ok=True)
 
-TEXT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"   # 384-d
-CLIP_MODEL = "ViT-B-32"
-CLIP_WEIGHTS = "openai"                                 # OpenCLIP tag
-CHUNK_WORDS  = 200                                      # default
+TXT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+IMG_MODEL = ("ViT-B-32", "openai")         # (arch, weights tag)
 
-# ---------- helpers ---------------------------------------------------------
+CHUNK_W, STRIDE = 400, 200
+SUMMARY_W       = 150                      # article-level summary window
+PREVIEW_CHARS   = 1_200                    # stored in article_meta
+
+ID_RE = re.compile(r"issue-(\d+)")
+
+# ── helpers ───────────────────────────────────────────────────────────────
 def device() -> str:
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
+    if torch.cuda.is_available(): return "cuda"
+    if torch.backends.mps.is_available(): return "mps"
     return "cpu"
 
+def windows(words: List[str], size: int, step: int):
+    if len(words) <= size:
+        yield " ".join(words)
+    else:
+        for i in range(0, len(words) - size + 1, step):
+            yield " ".join(words[i : i + size])
 
-def chunk(text: str, max_words: int) -> List[str]:
-    w = text.split()
-    return [" ".join(w[i : i + max_words]) for i in range(0, len(w), max_words)] or [""]
-
-
-# ---------- build routine ---------------------------------------------------
-def build(jsonl: Path, chunk_words: int, with_images: bool) -> None:
-    dev = device()
-    print(f"[info] embedding on {dev} ({platform.system()})")
-
-    txt_model = SentenceTransformer(TEXT_MODEL, device=dev)
-
-    import open_clip                          # local import keeps dependency optional
-    clip_model, _, clip_pp = open_clip.create_model_and_transforms(
-        CLIP_MODEL, pretrained=CLIP_WEIGHTS, device=dev
-    )
-    clip_model.eval()
-
-    text_vecs, text_meta = [], []
-    img_vecs,  img_meta  = [], []
-
-    with jsonl.open(encoding="utf-8") as fh:
-        for line in tqdm(fh, desc="Embedding articles"):
-            art = json.loads(line)
-            aid = art["id"]
-
-            # ---- text ----
-            for c_id, chunk_txt in enumerate(chunk(art["text"], chunk_words)):
-                if not chunk_txt.strip():
-                    continue
-                vec = txt_model.encode(chunk_txt, normalize_embeddings=True).astype("float32")
-                text_vecs.append(vec)
-                text_meta.append({
-                    "parent_id": aid, "chunk": c_id,
-                    "title": art["title"], "date": art["date"],
-                    "text": chunk_txt[:300]               # preview for Stage 4 prompt
-                })
-
-            # ---- images ----
-            if with_images:
-                for img in art.get("images", []):
-                    p = ROOT / img["path"]
-                    if not p.exists():
-                        continue
-                    try:
-                        pil = Image.open(p).convert("RGB")
-                    except Exception:                      # corrupt file
-                        continue
-                    inp = clip_pp(pil).unsqueeze(0).to(dev)
-                    with torch.no_grad():
-                        vec = clip_model.encode_image(inp)
-                        vec = vec / vec.norm(dim=-1, keepdim=True)
-                    img_vecs.append(vec.cpu().numpy().astype("float32"))
-                    img_meta.append({
-                        "parent_id": aid,
-                        "title": art["title"],
-                        "alt": img.get("alt", ""),
-                        "path": str(p.relative_to(ROOT)),
-                    })
-
-    _write("text", np.vstack(text_vecs), text_meta)
-    if with_images:
-        _write("image", np.vstack(img_vecs), img_meta)
-    print("[done] Indexes & vectors saved to", OUT_DIR.relative_to(ROOT))
-
-
-def _write(tag: str, vecs: np.ndarray, meta: list[dict]) -> None:
-    """Dump both .npy and FAISS (if available)."""
-    np.save(OUT_DIR / f"{tag}_vecs.npy", vecs)
-    with (OUT_DIR / f"{tag}_meta.pkl").open("wb") as f:
+def dump(tag: str, vecs: np.ndarray, meta: list[dict]):
+    np.save(OUT / f"{tag}_vecs.npy", vecs)
+    with (OUT / f"{tag}_meta.pkl").open("wb") as f:
         pickle.dump(meta, f)
+    if faiss:
+        idx = faiss.IndexIDMap(faiss.IndexFlatIP(vecs.shape[1]))
+        idx.add_with_ids(vecs, np.arange(len(vecs), dtype="int64"))
+        faiss.write_index(idx, str(OUT / f"{tag}.index"))
+        print(f"[info] {tag:<8} {len(meta)} vectors  +faiss")
+    else:
+        print(f"[warn] {tag:<8} {len(meta)} vectors  (.npy only)")
 
-    if faiss is None:
-        print(f"[warn] faiss-cpu missing → saved {tag}_vecs.npy only ({len(meta)} items)")
-        return
+# ── main build routine ────────────────────────────────────────────────────
+def build(skip_images: bool = False) -> None:
+    dev = device()
+    print(f"[info] device: {dev} ({platform.system()})")
 
-    idx = faiss.IndexIDMap(faiss.IndexFlatIP(vecs.shape[1]))
-    idx.add_with_ids(vecs, np.arange(vecs.shape[0], dtype="int64"))
-    faiss.write_index(idx, str(OUT_DIR / f"{tag}.index"))
-    print(f"[info] {tag:<5} index built   ({len(meta)} items)")
+    txt_encoder = SentenceTransformer(TXT_MODEL, device=dev)
+
+    import open_clip
+    clip, _, preproc = open_clip.create_model_and_transforms(*IMG_MODEL, device=dev)
+    clip.eval()
+
+    art_v, art_m, chk_v, chk_m, img_v, img_m = [], [], [], [], [], []
+
+    for line in tqdm(RAW.open(), desc="Articles"):
+        art = json.loads(line)
+        aid, title, date, text = art["id"], art["title"], art["date"], art["text"]
+        issue_num = ID_RE.match(aid).group(1) if ID_RE.match(aid) else "0"
+
+        # ── article-level vector (summary) ────────────────────────────────
+        summary = " ".join(text.split()[:SUMMARY_W])
+        art_v.append(
+            txt_encoder.encode(f"{title} – {summary}", normalize_embeddings=True)
+        )
+        art_m.append(
+            {
+                "id": aid,
+                "title": title,
+                "date": date,
+                "issue": int(issue_num),
+                "preview": text[:PREVIEW_CHARS],
+            }
+        )
+
+        # ── chunk-level vectors ───────────────────────────────────────────
+        words = text.split()
+        for c_id, chunk_txt in enumerate(windows(words, CHUNK_W, STRIDE)):
+            chk_v.append(txt_encoder.encode(chunk_txt, normalize_embeddings=True))
+            chk_m.append({"parent": aid, "chunk": c_id})
+
+        # ── images (optional) ────────────────────────────────────────────
+        if not skip_images:
+            for img in art.get("images", []):
+                p = ROOT / img["path"]
+                try:
+                    pil = Image.open(p).convert("RGB")
+                except Exception:  # corrupt / missing image
+                    continue
+                with torch.no_grad():
+                    vec = clip.encode_image(preproc(pil).unsqueeze(0).to(dev))
+                    vec /= vec.norm(dim=-1, keepdim=True)
+                img_v.append(vec.cpu().numpy())
+                img_m.append(
+                    {
+                        "parent": aid,
+                        "title": title,
+                        "path": str(p.relative_to(ROOT)),
+                        "alt": img.get("alt", ""),
+                    }
+                )
+
+    # ── persist ──────────────────────────────────────────────────────────
+    dump("article", np.vstack(art_v).astype("float32"), art_m)
+    dump("chunk", np.vstack(chk_v).astype("float32"), chk_m)
+    if not skip_images and img_v:
+        dump("image", np.vstack(img_v).astype("float32"), img_m)
 
 
-# ---------- CLI -------------------------------------------------------------
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--jsonl",  default=PROCESSED_JSON, type=Path)
-    ap.add_argument("--chunk",  default=CHUNK_WORDS,    type=int, help="words per text chunk")
-    ap.add_argument("--no-images", action="store_true", help="skip image embeddings")
-    args = ap.parse_args()
-
-    build(args.jsonl, args.chunk, with_images=not args.no_images)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--no-images", action="store_true")
+    build(skip_images=parser.parse_args().no_images)
