@@ -1,8 +1,13 @@
 """
-Tiny wrapper around Sentence-Transformers with singleton initialisation.
+embedder.py – cached wrapper around Sentence-Transformers.
+
+* Loads the model only once (LRU-cached singleton).
+* `embed()` returns L2-normalised vectors.
+    - str  → 1-D  float32 array
+    - list → 2-D  float32 array
 """
 from functools import lru_cache
-from typing import List
+from typing import List, Union
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
@@ -15,10 +20,6 @@ def _model() -> SentenceTransformer:
     return SentenceTransformer(EMB_MODEL)
 
 
-def embed(text: str | List[str]) -> np.ndarray:
-    """
-    Return L2-normalised embedding(s).
-    For a single string → 1-D array, for list[str] → 2-D array.
-    """
+def embed(text: Union[str, List[str]]) -> np.ndarray:
     vec = _model().encode(text, normalize_embeddings=True)
     return vec if isinstance(text, list) else vec.astype("float32")

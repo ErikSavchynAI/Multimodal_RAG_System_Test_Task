@@ -1,11 +1,12 @@
 """
-images.py – caption-based image selector (text-only)
+images.py – caption-based image selector.
 
-Every returned dict has:
+Returns ≤ IMG_SELECT_K images (always ≥ 1 when candidates exist), each
+dict containing:
     parent   – article ID
-    path     – original path on disk
-    file     – filename only (for UI convenience)
-    data_uri – base-64 JPEG (inline display)
+    path     – absolute path on disk
+    file     – filename for UI
+    data_uri – base-64-encoded, resized JPEG preview
 """
 from __future__ import annotations
 
@@ -22,7 +23,6 @@ from .embedder import embed
 
 
 def _jpeg_b64(path: Path) -> str:
-    """Return base-64 JPEG (RGB, resized)."""
     img = Image.open(path).convert("RGB")
     img.thumbnail((IMG_MAXDIM, IMG_MAXDIM))
     buf = BytesIO()
@@ -31,42 +31,34 @@ def _jpeg_b64(path: Path) -> str:
 
 
 def pick(question: str, candidates: List[Dict]) -> List[Dict]:
-    """
-    Select ≤ IMG_SELECT_K images whose captions match *question*.
-
-    Guarantees *at least one* image if candidates list is non-empty.
-    """
     if not candidates:
         return []
 
     qv = embed(question)
     scored: list[tuple[float, Dict]] = []
 
-    # work on copies so we never mutate the original data
     for im in candidates:
-        iw = copy.deepcopy(im)
-        iw["parent"] = iw.get("parent") or Path(iw["path"]).stem.split("_")[0]
-        caption = iw.get("alt") or iw.get("title", "")
+        item = copy.deepcopy(im)
+        item["parent"] = item.get("parent") or Path(item["path"]).stem.split("_")[0]
+        caption = item.get("alt") or item.get("title", "")
         sim = float(embed(caption) @ qv) if caption else 0.0
-        scored.append((sim, iw))
+        scored.append((sim, item))
 
-    # rank by similarity
     scored.sort(key=lambda t: -t[0])
 
-    selected, seen = [], set()
+    selected, parents = [], set()
     for sim, im in scored:
         if sim < MIN_IMG_SIM:
             break
-        if im["parent"] in seen:
+        if im["parent"] in parents:
             continue
         im["file"] = Path(im["path"]).name
         im["data_uri"] = _jpeg_b64(Path(im["path"]))
         selected.append(im)
-        seen.add(im["parent"])
+        parents.add(im["parent"])
         if len(selected) >= IMG_SELECT_K:
             break
 
-    # fallback: first candidate if nothing passed threshold
     if not selected:
         sim, im = scored[0]
         im["file"] = Path(im["path"]).name

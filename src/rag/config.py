@@ -11,7 +11,7 @@ DATA = ROOT / "data"                 # raw / processed / index live here
 
 # ── models ---------------------------------------------------------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or exit("Set GEMINI_API_KEY")
-GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-05-20")
 EMB_MODEL      = "sentence-transformers/all-MiniLM-L6-v2"
 
 # ── retrieval parameters -------------------------------------------------
@@ -24,7 +24,7 @@ STOPWORDS          = set("the a an is are was were of on in and to for how what 
 
 # ── image parameters -----------------------------------------------------
 IMG_SELECT_K = 3
-MIN_IMG_SIM  = 0.25
+MIN_IMG_SIM  = 0.15
 IMG_MAXDIM   = 768
 IMG_QUALITY  = 70
 
