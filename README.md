@@ -82,7 +82,10 @@ project_root/
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate
+
+source .venv/bin/activate #for Mac/Linux
+.\.venv\Scritps\activate  #for Windows
+
 pip install -r requirements.txt
 export GEMINI_API_KEY="your-key-here"
 ```
