@@ -34,7 +34,7 @@ for msg in st.session_state.history:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"], unsafe_allow_html=True)
         for im in msg.get("images", []):
-            st.markdown(img_tag(IMG_ROOT / im["file"], im.get("alt") or im.get("title")), unsafe_allow_html=True)
+            st.markdown(img_tag(IMG_ROOT / im.get("file", im["path"]), im.get("alt") or im.get("title")), unsafe_allow_html=True)
 
 # new question
 if q := st.chat_input("Ask The Batch…"):
@@ -60,13 +60,13 @@ if q := st.chat_input("Ask The Batch…"):
         aid = m.group(1)
         if aid in id2img:
             im = id2img.pop(aid)
-            parts.append(img_tag(IMG_ROOT / im["file"], im.get("alt") or im.get("title")))
+            parts.append(img_tag(IMG_ROOT / im.get("file", im["path"]), im.get("alt") or im.get("title")))
         last = m.end()
     parts.append(answer_md[last:])
 
     with st.chat_message("assistant"):
         st.markdown("".join(parts), unsafe_allow_html=True)
         for im in id2img.values():
-            st.markdown(img_tag(IMG_ROOT / im["file"], im.get("alt") or im.get("title")), unsafe_allow_html=True)
+            st.markdown(img_tag(IMG_ROOT / im.get("file", im["path"]), im.get("alt") or im.get("title")), unsafe_allow_html=True)
 
     st.session_state.history.append({"role": "assistant", "content": answer_md, "images": imgs})

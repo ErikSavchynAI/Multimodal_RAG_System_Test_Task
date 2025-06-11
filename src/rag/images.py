@@ -1,12 +1,19 @@
 """
-images.py – caption-based image picker (guaranteed >=1 if available)
+images.py – caption-based image selector (text-only)
+
+Every returned dict has:
+    parent   – article ID
+    path     – original path on disk
+    file     – filename only (for UI convenience)
+    data_uri – base-64 JPEG (inline display)
 """
 from __future__ import annotations
 
 import base64
+import copy
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 from PIL import Image
 
@@ -14,7 +21,8 @@ from .config import IMG_MAXDIM, IMG_QUALITY, IMG_SELECT_K, MIN_IMG_SIM
 from .embedder import embed
 
 
-def _encode_jpeg(path: Path) -> str:
+def _jpeg_b64(path: Path) -> str:
+    """Return base-64 JPEG (RGB, resized)."""
     img = Image.open(path).convert("RGB")
     img.thumbnail((IMG_MAXDIM, IMG_MAXDIM))
     buf = BytesIO()
@@ -22,45 +30,47 @@ def _encode_jpeg(path: Path) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def _score(caption: str, qv) -> float:
-    return float(embed(caption) @ qv) if caption else 0.0
-
-
 def pick(question: str, candidates: List[Dict]) -> List[Dict]:
     """
-    Return up to IMG_SELECT_K images.
-    • Primary: caption similarity ≥ MIN_IMG_SIM.
-    • Fallback: first image of first candidate article if none matched.
-    Each image dict gains 'data_uri' key (base-64 JPEG).
+    Select ≤ IMG_SELECT_K images whose captions match *question*.
+
+    Guarantees *at least one* image if candidates list is non-empty.
     """
     if not candidates:
         return []
 
     qv = embed(question)
-    ranked: List[Tuple[float, Dict]] = []
+    scored: list[tuple[float, Dict]] = []
 
+    # work on copies so we never mutate the original data
     for im in candidates:
-        caption = im.get("alt") or im.get("title", "")
-        sim = _score(caption, qv)
-        if sim >= MIN_IMG_SIM:
-            ranked.append((sim, im))
+        iw = copy.deepcopy(im)
+        iw["parent"] = iw.get("parent") or Path(iw["path"]).stem.split("_")[0]
+        caption = iw.get("alt") or iw.get("title", "")
+        sim = float(embed(caption) @ qv) if caption else 0.0
+        scored.append((sim, iw))
 
-    # sort by similarity desc, enforce one per parent article
-    ranked.sort(key=lambda t: -t[0])
-    selected, parents = [], set()
-    for sim, im in ranked:
-        if im["parent"] in parents:
+    # rank by similarity
+    scored.sort(key=lambda t: -t[0])
+
+    selected, seen = [], set()
+    for sim, im in scored:
+        if sim < MIN_IMG_SIM:
+            break
+        if im["parent"] in seen:
             continue
-        im["data_uri"] = _encode_jpeg(Path(im["path"]))
+        im["file"] = Path(im["path"]).name
+        im["data_uri"] = _jpeg_b64(Path(im["path"]))
         selected.append(im)
-        parents.add(im["parent"])
+        seen.add(im["parent"])
         if len(selected) >= IMG_SELECT_K:
             break
 
-    # fallback: at least one picture if any exist
-    if not selected and candidates:
-        first = candidates[0]
-        first["data_uri"] = _encode_jpeg(Path(first["path"]))
-        selected = [first]
+    # fallback: first candidate if nothing passed threshold
+    if not selected:
+        sim, im = scored[0]
+        im["file"] = Path(im["path"]).name
+        im["data_uri"] = _jpeg_b64(Path(im["path"]))
+        selected = [im]
 
     return selected
