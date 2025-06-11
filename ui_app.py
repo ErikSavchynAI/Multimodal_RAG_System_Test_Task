@@ -1,101 +1,84 @@
 """
-Streamlit chat UI for Multimodal RAG · rev 4
-────────────────────────────────────────────
-• Embeds images as Base-64 in markdown so they render without HTTP requests.
-• Keeps conversation context (last 3 turns) for every backend call.
-• No deprecated Streamlit args.
+ui_app.py – Streamlit chat UI for *The Batch* RAG demo.
+Run:  streamlit run ui_app.py
+Requires: env var GEMINI_API_KEY
 """
 from __future__ import annotations
-import base64, mimetypes, os, re, textwrap
+
+import base64
+import mimetypes
+import re
 from pathlib import Path
+
 import streamlit as st
-from PIL import Image
 
-from src.rag.qa import answer as rag_answer
+from src.rag.generator import answer as rag_answer
 
-ROOT = Path(__file__).resolve().parents[0]  # repo root
-IMG_ROOT = ROOT.resolve()
+ROOT      = Path(__file__).resolve().parent
+IMG_ROOT  = ROOT / "data" / "raw" / "images"
+IMG_WIDTH = 50  # %
 
-st.set_page_config("📰 The Batch · Chat", layout="wide")
+st.set_page_config("📰 The Batch Chat", layout="wide")
 st.title("📰 Ask *The Batch*")
 
-# -------- session state ---------------------------------------------------
 if "history" not in st.session_state:
-    st.session_state.history = []  # list[dict(role,content,images)]
+    st.session_state.history: list[dict] = []
 
-# -------- sidebar ---------------------------------------------------------
-with st.sidebar:
-    st.header("Settings")
-    enable_img = st.checkbox(
-        "Enable image reasoning", value=os.getenv("GEMINI_VISION", "0") == "1"
-    )
-    os.environ["GEMINI_VISION"] = "1" if enable_img else "0"
-    st.markdown(
-        textwrap.dedent(
-            """
-            **Examples**
-            • What is the latest issue about?  
-            • Summarise May 27 2020 issue with an image.  
-            • How often does The Batch come out?
-            """
-        )
-    )
 
-# -------- helper: Base-64 inline markdown ---------------------------------
-def _img_md(path: Path, caption: str) -> str:
+def _img_tag(path: Path, caption: str) -> str:
     mime, _ = mimetypes.guess_type(path.name)
-    if mime is None:
-        mime = "image/jpeg"
-    with path.open("rb") as f:
-        b64 = base64.b64encode(f.read()).decode()
-    return f'\n\n![{caption}](data:{mime};base64,{b64})\n\n'
+    mime = mime or "image/jpeg"
+    b64 = base64.b64encode(path.read_bytes()).decode()
+    style = f"width:{IMG_WIDTH}%;border-radius:8px;"
+    return f'\n\n<img src="data:{mime};base64,{b64}" alt="{caption}" style="{style}">\n\n'
 
-# -------- replay history --------------------------------------------------
+
+# ── replay existing chat ─────────────────────────────────────────────
 for msg in st.session_state.history:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"], unsafe_allow_html=True)
         for im in msg.get("images", []):
-            md = _img_md(IMG_ROOT / im["path"], im.get("alt") or im.get("title"))
-            st.markdown(md, unsafe_allow_html=True)
+            st.markdown(
+                _img_tag(IMG_ROOT / im.get("file", im["path"]), im.get("alt") or im.get("title")),
+                unsafe_allow_html=True,
+            )
 
-# -------- new user input --------------------------------------------------
-if user_q := st.chat_input("Ask The Batch…"):
-    st.chat_message("user").markdown(user_q)
-    st.session_state.history.append({"role": "user", "content": user_q})
+# ── new user input ──────────────────────────────────────────────────
+if q := st.chat_input("Ask The Batch…"):
+    st.chat_message("user").markdown(q)
+    st.session_state.history.append({"role": "user", "content": q})
 
-    # build short conversational context
-    ctx_pairs = st.session_state.history[-6:]  # last 3 Q&A
-    convo = "\n\n".join(
+    # build short context from last 10 turns
+    ctx = "\n\n".join(
         f"{m['role'].upper()}: {m['content']}"
-        for m in ctx_pairs
+        for m in st.session_state.history[-10:]
         if m["role"] in {"user", "assistant"}
     )
-    backend_prompt = user_q if not convo else f"{convo}\n\nNEW USER QUESTION:\n{user_q}"
+    backend_prompt = q if not ctx else f"{ctx}\n\nNEW USER QUESTION:\n{q}"
 
     with st.spinner("Retrieving…"):
         res = rag_answer(backend_prompt)
 
-    answer, imgs = res["answer"], res["images"]
+    answer_md, imgs = res["answer"], res["images"]
 
-    # inject inline images
-    id2im = {im["parent"]: im for im in imgs}
+    # inline first image after its citation
+    id2img = {im["parent"]: im for im in imgs}
     parts, last = [], 0
-    for m in re.finditer(r"\[(issue-[^\]]+)\]", answer):
-        parts.append(answer[last:m.end()])
-        iid = m.group(1)
-        if iid in id2im:
-            im = id2im.pop(iid)
-            parts.append(_img_md(IMG_ROOT / im["path"], im.get("alt") or im.get("title")))
+    for m in re.finditer(r"\[(issue-[^\]]+)\]", answer_md):
+        parts.append(answer_md[last : m.end()])
+        aid = m.group(1)
+        if aid in id2img:
+            im = id2img.pop(aid)
+            parts.append(_img_tag(IMG_ROOT / im.get("file", im["path"]), im.get("alt") or im.get("title")))
         last = m.end()
-    parts.append(answer[last:])
+    parts.append(answer_md[last:])
 
     with st.chat_message("assistant"):
         st.markdown("".join(parts), unsafe_allow_html=True)
-        # leftover images
-        for im in id2im.values():
-            st.markdown(_img_md(IMG_ROOT / im["path"], im.get("alt") or im.get("title")),
-                        unsafe_allow_html=True)
+        for im in id2img.values():  # any images not yet shown
+            st.markdown(
+                _img_tag(IMG_ROOT / im.get("file", im["path"]), im.get("alt") or im.get("title")),
+                unsafe_allow_html=True,
+            )
 
-    st.session_state.history.append(
-        {"role": "assistant", "content": answer, "images": imgs}
-    )
+    st.session_state.history.append({"role": "assistant", "content": answer_md, "images": imgs})
